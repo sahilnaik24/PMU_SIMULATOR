@@ -1,0 +1,51 @@
+{
+    "PMU_imp_test_1": {
+        "pmu_id": 100,
+        "data_rate": 100,
+        "port": 3001,
+        "ip": "127.0.0.1",
+        "method": "tcp",
+        "buffer": 2048,
+        "log_level": "DEBUG",
+        "station_name": "NSU Station",
+        "time_base": 1000000,
+        "phasor_num": 12,
+        "analog_num": 10,
+        "digital_num": 1,
+        "nominal_freq": 50,
+        "cfg_count": 1
+    },
+    "PMU_imp_test_2": {
+        "pmu_id": 101,
+        "data_rate": 100,
+        "port": 3002,
+        "ip": "127.0.0.1",
+        "method": "tcp",
+        "buffer": 2048,
+        "log_level": "DEBUG",
+        "station_name": "NSU Station",
+        "time_base": 1000000,
+        "phasor_num": 12,
+        "analog_num": 10,
+        "digital_num": 1,
+        "nominal_freq": 50,
+        "cfg_count": 1
+    },
+    "PMU_imp_test_3": {
+        "pmu_id": 100,
+        "data_rate": 100,
+        "port": 3003,
+        "ip": "127.0.0.1",
+        "method": "tcp",
+        "buffer": 2048,
+        "log_level": "DEBUG",
+        "station_name": "NSU Station",
+        "time_base": 1000000,
+        "phasor_num": 12,
+        "analog_num": 10,
+        "digital_num": 1,
+        "nominal_freq": 50,
+        "cfg_count": 1
+    }
+    
+}
