@@ -3,7 +3,7 @@ import socket
 
 from select import select
 from threading import Thread
-from multiprocessing import Queue, Process
+from queue import Queue, Full
 from sys import stdout
 from time import sleep, time
 from synchrophasor.frame import *
@@ -14,6 +14,22 @@ __credits__ = []
 __license__ = "BSD-3"
 __version__ = "1.0.0-alpha"
 
+
+class DroppingQueue(Queue):
+    def __init__(self, maxsize):
+        super().__init__(maxsize=maxsize)
+
+    def put(self, item):
+        try:
+            super().put(item, block=False)
+        except Full:
+            # queue is full → discard the oldest frame
+            try:
+                _ = self.get_nowait()
+            except Exception:
+                pass
+            # now there’s room for the new one
+            super().put(item, block=False)
 
 class Pmu(object):
 
@@ -148,6 +164,8 @@ class Pmu(object):
         self.listener = Thread(target=self.acceptor)
         self.listener.daemon = True
         self.listener.start()
+    
+
 
     def acceptor(self):
         while not self._stopped:
@@ -163,17 +181,30 @@ class Pmu(object):
                     self.logger.error("OSError in acceptor: %s", e)
                     break
 
-            buffer = Queue()
+
+            # buffer = Queue()
+            buffer = DroppingQueue(maxsize=500)
             self.client_buffers.append(buffer)
-            process = Process(target=self.pdc_handler, args=(
-                conn, address, buffer, self.cfg2.get_id_code(),
-                self.cfg2.get_data_rate(), self.cfg1, self.cfg2,
-                self.cfg3, self.header, self.buffer_size,
-                self.set_timestamp, self.logger.level))
-            process.daemon = True
-            process.start()
-            self.clients.append(process)
-            conn.close()
+
+            thread = Thread(
+                target=self.pdc_handler,
+                args=(
+                    conn, address, buffer,
+                    self.cfg2.get_id_code(),
+                    self.cfg2.get_data_rate(),
+                    self.cfg1, self.cfg2,
+                    self.cfg3, self.header,
+                    self.buffer_size,
+                    self.set_timestamp,
+                    self.logger.level
+                ),
+                daemon=True                 # note the comma above!
+            )
+            thread.start()
+            self.clients.append(thread)
+
+
+            # conn.close()  #---> used when multiprocess, not thread
 
     def join(self):
         while self.listener.is_alive():
@@ -196,98 +227,104 @@ class Pmu(object):
         except Exception as e:
             self.logger.error("Error while stopping PMU: %s", e)
 
+
+
+    # New method with thread.
     @staticmethod
-    def pdc_handler(connection, address, buffer, pmu_id, data_rate, cfg1, cfg2, cfg3, header,
-                    buffer_size, set_timestamp, log_level):
-        logger = logging.getLogger(address[0] + str(address[1]))
+    def pdc_handler(connection, address, buffer, pmu_id, data_rate,
+                    cfg1, cfg2, cfg3, header, buffer_size,
+                    set_timestamp, log_level):
+        logger = logging.getLogger(f"{address[0]}:{address[1]}")
         logger.setLevel(log_level)
         handler = logging.StreamHandler(stdout)
-        formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-        handler.setFormatter(formatter)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         logger.addHandler(handler)
 
         logger.info("[%d] - Connection from %s:%d", pmu_id, address[0], address[1])
-        sending_measurements_enabled = False
+        sending_measurements = False
         delay = 1.0 / data_rate if data_rate > 0 else -data_rate
 
         try:
             while True:
                 command = None
                 received_data = b""
-                readable, _, _ = select([connection], [], [], 0)
-                if readable:
-                    # Read the first 4 bytes to determine frame size
+                # wait for any incoming data
+                ready, _, _ = select([connection], [], [], 0)
+                if ready:
+                    # read frame length prefix
                     while len(received_data) < 4:
-                        received_data += connection.recv(buffer_size)
-                    bytes_received = len(received_data)
-                    total_frame_size = int.from_bytes(received_data[2:4], byteorder="big", signed=False)
-                    # Continue reading until complete frame is received
-                    while bytes_received < total_frame_size:
-                        message_chunk = connection.recv(min(total_frame_size - bytes_received, buffer_size))
-                        if not message_chunk:
-                            break
-                        received_data += message_chunk
-                        bytes_received += len(message_chunk)
-                    if len(received_data) == total_frame_size:
-                        try:
-                            received_message = CommonFrame.convert2frame(received_data)
-                            if isinstance(received_message, CommandFrame):
-                                command = received_message.get_command()
-                                logger.info("[%d] - Received command: [%s] <- (%s:%d)",
-                                            pmu_id, command, address[0], address[1])
-                            else:
-                                logger.info("[%d] - Received [%s] <- (%s:%d)",
-                                            pmu_id, type(received_message).__name__, address[0], address[1])
-                        except FrameError:
-                            logger.warning("[%d] - Received unknown message <- (%s:%d)",
-                                           pmu_id, address[0], address[1])
+                        chunk = connection.recv(buffer_size)
+                        if not chunk:
+                            raise ConnectionError("Client disconnected during header read")
+                        received_data += chunk
+
+                    total_size = int.from_bytes(received_data[2:4], "big")
+                    # read until full frame
+                    while len(received_data) < total_size:
+                        chunk = connection.recv(min(buffer_size, total_size - len(received_data)))
+                        if not chunk:
+                            raise ConnectionError("Client disconnected mid-frame")
+                        received_data += chunk
+
+                    # parse into a frame object
+                    try:
+                        frame = CommonFrame.convert2frame(received_data)
+                    except FrameError:
+                        logger.warning("[%d] - Bad frame from %s:%d", pmu_id, *address)
+                        continue
+
+                    if isinstance(frame, CommandFrame):
+                        command = frame.get_command()
+                        logger.info("[%d] - Cmd [%s] from %s:%d", pmu_id, command, *address)
                     else:
-                        logger.warning("[%d] - Message not received completely <- (%s:%d)",
-                                       pmu_id, address[0], address[1])
+                        logger.info("[%d] - %s from %s:%d",
+                                    pmu_id, type(frame).__name__, *address)
+
+                # handle commands
                 if command:
                     if command == "start":
-                        sending_measurements_enabled = True
-                        logger.info("[%d] - Start sending -> (%s:%d)", pmu_id, address[0], address[1])
+                        sending_measurements = True
                     elif command == "stop":
-                        logger.info("[%d] - Stop sending -> (%s:%d)", pmu_id, address[0], address[1])
-                        sending_measurements_enabled = False
-                    elif command == "header":
-                        if set_timestamp: header.set_time()
-                        connection.sendall(header.convert2bytes())
-                        logger.info("[%d] - Requested Header frame sent -> (%s:%d)",
-                                    pmu_id, address[0], address[1])
-                    elif command == "cfg1":
-                        if set_timestamp: cfg1.set_time()
-                        connection.sendall(cfg1.convert2bytes())
-                        logger.info("[%d] - Requested Configuration frame 1 sent -> (%s:%d)",
-                                    pmu_id, address[0], address[1])
-                    elif command == "cfg2":
-                        if set_timestamp: cfg2.set_time()
-                        connection.sendall(cfg2.convert2bytes())
-                        logger.info("[%d] - Requested Configuration frame 2 sent -> (%s:%d)",
-                                    pmu_id, address[0], address[1])
-                    elif command == "cfg3":
-                        if set_timestamp and cfg3:
-                            cfg3.set_time()
-                        if cfg3:
-                            connection.sendall(cfg3.convert2bytes())
-                        logger.info("[%d] - Requested Configuration frame 3 sent -> (%s:%d)",
-                                    pmu_id, address[0], address[1])
-                if sending_measurements_enabled and not buffer.empty():
+                        sending_measurements = False
+                    elif command in ("header", "cfg1", "cfg2", "cfg3"):
+                        target = {
+                            "header": header,
+                            "cfg1": cfg1,
+                            "cfg2": cfg2,
+                            "cfg3": cfg3
+                        }[command]
+                        if target:
+                            if set_timestamp:
+                                target.set_time()
+                            connection.sendall(target.convert2bytes())
+                            logger.info("[%d] - Sent %s to %s:%d",
+                                        pmu_id, command, *address)
+
+                # send measurement frames from buffer
+                # print("Sending measurements:", sending_measurements,"buffer empty:", buffer.empty())
+                if sending_measurements and not buffer.empty():
                     data = buffer.get()
                     if isinstance(data, CommonFrame):
-                        if set_timestamp: data.set_time()
+                        if set_timestamp:
+                            data.set_time()
                         data = data.convert2bytes()
                     sleep(delay)
                     connection.sendall(data)
-                    logger.debug("[%d] - Message sent at [%f] -> (%s:%d)",
-                                 pmu_id, time(), address[0], address[1])
-        except Exception as e:
-            print(e)
-        finally:
-            connection.close()
-            logger.info("[%d] - Connection from %s:%d has been closed.", pmu_id, address[0], address[1])
+                    logger.debug("[%d] - Sent data at %f to %s:%d",
+                                pmu_id, time(), *address)
 
+        except ConnectionError as ce:
+            logger.info("[%d] - Client %s:%d disconnected: %s", pmu_id, *address, ce)
+        except Exception:
+            logger.exception("[%d] - Unexpected error in handler for %s:%d", pmu_id, *address)
+        finally:
+            # ensure socket is shut down and closed exactly once
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            connection.close()
+            logger.info("[%d] - Closed connection to %s:%d", pmu_id, *address)
 
 class PmuError(BaseException):
     pass
